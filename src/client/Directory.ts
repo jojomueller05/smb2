@@ -35,9 +35,7 @@ class Directory extends EventEmitter {
   private watchingMessageIds: bigint[] = [];
   private watchRecursive: boolean;
 
-  constructor(
-    private tree: Tree
-  ) {
+  constructor(private tree: Tree) {
     super();
   }
 
@@ -45,29 +43,31 @@ class Directory extends EventEmitter {
     if (this.isOpen) return;
 
     const buffer = Buffer.from(util.toWindowsFilePath(path), "ucs2");
-    const response = await this.tree.request({ type: PacketType.Create }, {
-      buffer,
-      desiredAccess: typeof options.desiredAccess === "number" ?
-        options.desiredAccess :
-        (
-          DirectoryAccess.ListDirectory |
-          DirectoryAccess.ReadAttributes |
-          DirectoryAccess.Synchronize
-        ),
-      fileAttributes: FileAttribute.Directory,
-      shareAccess:
-        ShareAccessType.Read |
-        ShareAccessType.Write |
-        ShareAccessType.Delete,
-      createDisposition: typeof options.createDisposition === "number" ?
-        options.createDisposition :
-        CreateDispositionType.Open,
-      createOptions: typeof options.createOptions === "number" ?
-        options.createOptions :
-        CreateOptions.None,
-      nameOffset: 0x0078,
-      createContextsOffset: 0x007a + buffer.length
-    });
+    const response = await this.tree.request(
+      { type: PacketType.Create },
+      {
+        buffer,
+        desiredAccess:
+          typeof options.desiredAccess === "number"
+            ? options.desiredAccess
+            : DirectoryAccess.ListDirectory |
+            DirectoryAccess.ReadAttributes |
+            DirectoryAccess.Synchronize,
+        fileAttributes: FileAttribute.Directory,
+        shareAccess:
+          ShareAccessType.Read | ShareAccessType.Write | ShareAccessType.Delete,
+        createDisposition:
+          typeof options.createDisposition === "number"
+            ? options.createDisposition
+            : CreateDispositionType.Open,
+        createOptions:
+          typeof options.createOptions === "number"
+            ? options.createOptions
+            : CreateOptions.None,
+        nameOffset: 0x0078,
+        createContextsOffset: 0x007a + buffer.length,
+      },
+    );
 
     this._id = response.body.fileId as string;
     this.isOpen = true;
@@ -78,7 +78,7 @@ class Directory extends EventEmitter {
   async create(path: string) {
     await this.open(path, {
       createDisposition: CreateDispositionType.Create,
-      createOptions: CreateOptions.Directory
+      createOptions: CreateOptions.Directory,
     });
   }
 
@@ -96,7 +96,10 @@ class Directory extends EventEmitter {
     if (!this.watching) return;
     this.watching = false;
 
-    this.tree.session.client.removeListener("changeNotify", this.onChangeNotify);
+    this.tree.session.client.removeListener(
+      "changeNotify",
+      this.onChangeNotify,
+    );
 
     await this.close();
   }
@@ -117,11 +120,11 @@ class Directory extends EventEmitter {
     const request = this.tree.createRequest(
       { type: PacketType.ChangeNotify },
       {
-        flags: this.watchRecursive ?
-          ChangeNotifyFlags.WatchTreeRecursively :
-          ChangeNotifyFlags.None,
-        fileId: this._id
-      }
+        flags: this.watchRecursive
+          ? ChangeNotifyFlags.WatchTreeRecursively
+          : ChangeNotifyFlags.None,
+        fileId: this._id,
+      },
     );
     this.watchingMessageIds.push(request.header.messageId);
 
@@ -129,33 +132,74 @@ class Directory extends EventEmitter {
     if (
       response.header.status !== StatusCode.Success &&
       response.header.status !== StatusCode.Pending
-    ) throw new Error(`ChangeNotify: ${structureUtil.parseEnumValue(StatusCode, response.header.status)} (${response.header.status})`);
+    )
+      throw new Error(
+        `ChangeNotify: ${structureUtil.parseEnumValue(StatusCode, response.header.status)} (${response.header.status})`,
+      );
 
     return response;
   }
 
   async flush() {
-    await this.tree.request({
-      type: PacketType.Flush
-    }, {
-      fileId: this._id
-    });
+    await this.tree.request(
+      {
+        type: PacketType.Flush,
+      },
+      {
+        fileId: this._id,
+      },
+    );
   }
 
   async read() {
-    const response = await this.tree.request({ type: PacketType.QueryDirectory }, {
-      fileId: this._id,
-      buffer: Buffer.from("*", "ucs2")
-    });
+    let allEntries: any[] = [];
+    let hasMore = true;
+    let isFirstRequest = true;
 
-    let entries: DirectoryEntry[] = [];
-    if (response.data) {
-      entries = response.data.filter(x => x.filename !== "." && x.filename !== "..")
-    } else {
-      console.warn("response without data", response);
+    while (hasMore) {
+      try {
+        const response = await this.tree.request(
+          { type: PacketType.QueryDirectory },
+          {
+            fileId: this._id,
+            // First call needs "*", subsequent calls need empty buffer
+            buffer: isFirstRequest
+              ? Buffer.from("*\0", "ucs2")
+              : Buffer.alloc(0),
+          },
+        );
+
+        isFirstRequest = false;
+
+        // If we got data, add it to our list
+        const currentBatch = Array.isArray(response)
+          ? response
+          : response?.data || [];
+        if (currentBatch && currentBatch.length > 0) {
+          const filtered = currentBatch.filter(
+            (x: any) => x.filename !== "." && x.filename !== "..",
+          );
+          allEntries.push(...filtered);
+        } else {
+          hasMore = false; // No data returned, we are done
+        }
+      } catch (err: any) {
+        // 0x80000006 is STATUS_NO_MORE_FILES.
+        // In decimal (signed 32-bit), it often shows up as -2147483642
+        // or as 2147483654 (unsigned).
+        const status = err?.header?.status;
+
+        if (status === 0x80000006 || status === 2147483654) {
+          // This isn't an error! It's the server saying "That's all folks!"
+          hasMore = false;
+        } else {
+          // If it's a different error (like network loss), re-throw it
+          throw err;
+        }
+      }
     }
 
-    return entries;
+    return allEntries;
   }
 
   async exists(path: string) {
@@ -194,12 +238,15 @@ class Directory extends EventEmitter {
   }
 
   async setInfo(fileInfoClass: number, buffer: Buffer) {
-    await this.tree.request({ type: PacketType.SetInfo }, {
-      infoType: InfoType.File,
-      fileId: this._id,
-      fileInfoClass,
-      buffer
-    });
+    await this.tree.request(
+      { type: PacketType.SetInfo },
+      {
+        infoType: InfoType.File,
+        fileId: this._id,
+        fileInfoClass,
+        buffer,
+      },
+    );
   }
 
   async close() {
